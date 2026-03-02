@@ -1,94 +1,158 @@
-import requests
-import math
+import json
 from typing import Dict, Any
+from azure_client import get_client, get_deployment
+from tools.location_tools import get_geoip_location, get_nearby_hospitals
 
-
-def get_geoip_location():
-    response = requests.get("http://ip-api.com/json/")
-    data = response.json()
-
-    if data["status"] != "success":
-        raise RuntimeError("Failed to fetch GeoIP location")
-
-    return {
-        "lat": data["lat"],
-        "lon": data["lon"],
-        "city": data["city"],
-        "country": data["country"]
-    }
-
-
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlon / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
-
-
-def get_nearby_hospitals(lat, lon, radius_km=5):
-    overpass_url = "https://overpass-api.de/api/interpreter"
-
-    query = f"""
-    [out:json];
-    node
-      ["amenity"="hospital"]
-      (around:{radius_km * 1000},{lat},{lon});
-    out;
-    """
-
-    response = requests.post(overpass_url, data={"data": query})
-    data = response.json()
-
-    hospitals = []
-
-    for element in data.get("elements", []):
-        hospital_lat = element["lat"]
-        hospital_lon = element["lon"]
-
-        distance = haversine(lat, lon, hospital_lat, hospital_lon)
-
-        hospitals.append({
-            "name": element.get("tags", {}).get("name", "Unnamed Hospital"),
-            "distance_km": round(distance, 2),
-            "latitude": hospital_lat,
-            "longitude": hospital_lon
-        })
-
-    hospitals.sort(key=lambda x: x["distance_km"])
-
-    return hospitals[:5]
+client = get_client()
+deployment = get_deployment()
 
 
 def hospital_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    location = get_geoip_location()
-    hospitals = get_nearby_hospitals(location["lat"], location["lon"])
+    print("STATE ENTERING Hospital NODE:")
+    print(state)
 
-    severity = state["vision_json"]["clinical_indicators"]["severity_score"]
+    vision = state["vision_json"]
+    severity = vision["clinical_indicators"]["severity_score"]
+    infection = vision["clinical_indicators"]["infection_risk"]
+    bleeding = vision["observations"]["bleeding_level"]
 
-    if severity >= 8:
-        urgency = "EMERGENCY"
-        advice = "Seek emergency medical care immediately."
-    elif severity >= 5:
-        urgency = "URGENT"
-        advice = "Visit a hospital or urgent care facility as soon as possible."
-    else:
-        urgency = "MEDICAL_REVIEW"
-        advice = "Consult a healthcare provider for further evaluation."
+    # ==========================================================
+    # 🔴 HARD SAFETY OVERRIDE (Deterministic)
+    # ==========================================================
+    if severity >= 9 or infection >= 0.9 or bleeding == "heavy":
+        print("⚠️ SAFETY OVERRIDE TRIGGERED")
+
+        location = get_geoip_location()
+        hospitals = get_nearby_hospitals(
+            location["lat"], location["lon"], radius_km=20)
+
+        return {
+            "final_output": {
+                "action": "SEEK_MEDICAL_CARE",
+                "urgency": "EMERGENCY",
+                "advice": "This appears to be a severe or high-risk condition. Seek immediate emergency medical care.",
+                "user_location": location,
+                "nearby_hospitals": hospitals,
+                "override": True
+            }
+        }
+
+    # ==========================================================
+    # 🟡 AI TOOL-DRIVEN TRIAGE (For non-extreme cases)
+    # ==========================================================
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_geoip_location",
+                "description": "Get user's approximate location based on IP address.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_nearby_hospitals",
+                "description": "Find nearby hospitals around given latitude and longitude.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "lat": {"type": "number"},
+                        "lon": {"type": "number"},
+                        "radius_km": {"type": "number"},
+                    },
+                    "required": ["lat", "lon"],
+                },
+            },
+        },
+    ]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a medical triage assistant. "
+                "Determine urgency level based on structured clinical indicators. "
+                "Use available tools to obtain location and hospitals if appropriate. "
+                "Return ONLY valid JSON in this format:\n"
+                "{\n"
+                '  "urgency": "EMERGENCY|URGENT|MEDICAL_REVIEW",\n'
+                '  "advice": "string",\n'
+                '  "user_location": { ... },\n'
+                '  "nearby_hospitals": [ ... ]\n'
+                "}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"""
+Structured injury analysis:
+
+{json.dumps(vision, indent=2)}
+
+Risk level: {state.get("risk_level")}
+
+Determine urgency and fetch hospitals if needed.
+""",
+        },
+    ]
+
+    response = client.chat.completions.create(
+        model=deployment,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        max_completion_tokens=1500,
+    )
+
+    message = response.choices[0].message
+
+    # ---------------- TOOL LOOP ----------------
+    while message.tool_calls:
+        for tool_call in message.tool_calls:
+            function_name = tool_call.function.name
+            arguments = json.loads(tool_call.function.arguments or "{}")
+
+            if function_name == "get_geoip_location":
+                result = get_geoip_location()
+
+            elif function_name == "get_nearby_hospitals":
+                result = get_nearby_hospitals(
+                    lat=arguments["lat"],
+                    lon=arguments["lon"],
+                    radius_km=arguments.get("radius_km", 10),
+                )
+            else:
+                result = {"error": "Unknown tool"}
+
+            messages.append(message)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                }
+            )
+
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            max_completion_tokens=1500,
+        )
+
+        message = response.choices[0].message
+
+    # ---------------- FINAL RESPONSE ----------------
+
+    final_data = json.loads(message.content)
 
     return {
         "final_output": {
             "action": "SEEK_MEDICAL_CARE",
-            "urgency": urgency,
-            "advice": advice,
-            "user_location": location,
-            "nearby_hospitals": hospitals
+            **final_data,
+            "override": False
         }
     }

@@ -15,6 +15,8 @@ def home_node(state: Dict[str, Any]) -> Dict[str, Any]:
     Uses GPT-5 mini with sufficient token budget
     to avoid reasoning-token exhaustion.
     """
+    print("STATE ENTERING Home NODE:")
+    print(state)
 
     summary = state["vision_json"]["condition_summary"]
 
